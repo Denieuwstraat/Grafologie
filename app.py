@@ -1,74 +1,34 @@
-"""
-Streamlit-app: Grafologische analyse van handschrift uit een geüploade afbeelding
-
-Wat het doet
-- Neemt een afbeelding (foto/scan) met handschrift aan
-- Voert eenvoudige computer vision-metingen uit (heuristisch):
-  * lettergrootte (schatting via connected components)
-  * schrijfdruk (proxy via gemiddelde streek-donkerte / inktdekking)
-  * hellingshoek (slant) van letters (proxy via gradient-orientaties)
-  * woord- en regelspatiëring (via projectieprofielen en tussenruimtes)
-  * paginamarges links/rechts/boven/onder
-  * optionele handtekening-indicatie (grote, vloeiende component onderaan)
-- Zet metingen om naar traditionele grafologische interpretaties (rule-based)
-- Schrijft een samenhangend persoonlijkheidsprofiel (meerdere stijlen en lengtes)
-
-Benodigdheden
-pip install streamlit opencv-python-headless pillow numpy scikit-image
-
-Starten
-streamlit run grafologie_app.py
-"""
-
+# grafologie_app.py
 from __future__ import annotations
+
 import io
 import math
 import textwrap
 from dataclasses import dataclass
-from typing import Dict, Tuple, List
+from typing import Dict, Tuple, List, Optional
 
 import numpy as np
 from PIL import Image, ImageOps
-from skimage.morphology import skeletonize
 import cv2
 import streamlit as st
 
 # -------------------------
-# Hulpfuncties beeldbewerking
+# Config / UI style
 # -------------------------
 
-def pil_to_cv(img: Image.Image) -> np.ndarray:
-    return cv2.cvtColor(np.array(img), cv2.COLOR_RGB2BGR)
+CSS = """
+<style>
+.badge {display:inline-block;padding:0.25rem 0.5rem;border-radius:999px;background:#EEF2FF;color:#1E40AF;font-size:0.85rem;margin-right:6px}
+.kpi {display:flex;gap:12px;flex-wrap:wrap;margin-bottom:0.5rem}
+.card {border:1px solid #e5e7eb;border-radius:12px;padding:16px;background:#fff}
+.small {opacity:0.75}
+.hr {height:1px;background:#e5e7eb;border:none;margin:12px 0}
+</style>
+"""
 
-
-def cv_to_pil(arr: np.ndarray) -> Image.Image:
-    return Image.fromarray(cv2.cvtColor(arr, cv2.COLOR_BGR2RGB))
-
-
-def preprocess(img_pil: Image.Image, resize_max: int = 1600) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Return (gray, bin_inv, vis) as uint8 arrays.
-    - gray: grayscale
-    - bin_inv: binary (ink=1, background=0)
-    - vis: contrast-stretched preview
-    """
-    img_pil = ImageOps.exif_transpose(img_pil)
-    # Downscale for speed, preserve aspect
-    w, h = img_pil.size
-    scale = 1.0
-    if max(w, h) > resize_max:
-        scale = resize_max / max(w, h)
-        img_pil = img_pil.resize((int(w * scale), int(h * scale)), Image.LANCZOS)
-    cv = pil_to_cv(img_pil)
-    gray = cv2.cvtColor(cv, cv2.COLOR_BGR2GRAY)
-    # Contrast normalize
-    gray_eq = cv2.equalizeHist(gray)
-    # Adaptive threshold (robust for lighting)
-    bin_ = cv2.adaptiveThreshold(gray_eq, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-                                 cv2.THRESH_BINARY, 35, 12)
-    bin_inv = (255 - bin_) // 255  # 1=ink, 0=bg
-    vis = cv2.cvtColor(gray_eq, cv2.COLOR_GRAY2BGR)
-    return gray_eq, bin_inv.astype(np.uint8), vis
-
+# -------------------------
+# Dataclasses
+# -------------------------
 
 @dataclass
 class Measures:
@@ -82,15 +42,81 @@ class Measures:
 
 
 # -------------------------
-# Metingen (heuristieken)
+# Helpers
 # -------------------------
 
+def pil_to_cv(img: Image.Image) -> np.ndarray:
+    return cv2.cvtColor(np.array(img), cv2.COLOR_RGB2BGR)
+
+def cv_to_pil(arr: np.ndarray) -> Image.Image:
+    return Image.fromarray(cv2.cvtColor(arr, cv2.COLOR_BGR2RGB))
+
+def bytes_from_pil(img: Image.Image, fmt: str = "PNG") -> bytes:
+    buf = io.BytesIO()
+    img.save(buf, format=fmt)
+    return buf.getvalue()
+
+# -------------------------
+# Preprocess & features
+# -------------------------
+
+@st.cache_data(show_spinner=False)
+def preprocess(
+    img_bytes: bytes,
+    resize_max: int = 1600,
+    denoise: bool = True,
+    adapt_block: int = 35,
+    adapt_C: int = 12,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """
+    Return (gray_eq, bin_inv, vis) as uint8 arrays.
+    - gray_eq: equalized grayscale
+    - bin_inv: binary (ink=1, background=0)
+    - vis: BGR preview
+    """
+    img_pil = Image.open(io.BytesIO(img_bytes)).convert("RGB")
+    img_pil = ImageOps.exif_transpose(img_pil)
+
+    # Downscale for speed, preserve aspect
+    w, h = img_pil.size
+    if max(w, h) > resize_max:
+        scale = resize_max / max(w, h)
+        img_pil = img_pil.resize((int(w * scale), int(h * scale)), Image.LANCZOS)
+
+    cv = pil_to_cv(img_pil)
+    gray = cv2.cvtColor(cv, cv2.COLOR_BGR2GRAY)
+
+    # Gentle denoise helps adaptive threshold on phone photos
+    if denoise:
+        gray = cv2.fastNlMeansDenoising(gray, None, 7, 7, 21)
+
+    # Contrast normalize
+    gray_eq = cv2.equalizeHist(gray)
+
+    # Adaptive threshold (robust for lighting); ensure odd block size >= 3
+    adapt_block = max(3, adapt_block | 1)
+    bin_ = cv2.adaptiveThreshold(gray_eq, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+                                 cv2.THRESH_BINARY, adapt_block, adapt_C)
+
+    # ink=1, bg=0
+    bin_inv = (255 - bin_) // 255
+    vis = cv2.cvtColor(gray_eq, cv2.COLOR_GRAY2BGR)
+    return gray_eq, bin_inv.astype(np.uint8), vis
+
+
+def _connected_components_stats(bin_inv: np.ndarray):
+    # Use OpenCV connected components on binary mask (0/1 -> 0/255)
+    mask = (bin_inv * 255).astype(np.uint8)
+    num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(mask, connectivity=8)
+    return num_labels, labels, stats, centroids
+
+
 def estimate_letter_height(bin_inv: np.ndarray) -> float:
-    # Connected components
-    labels, stats = cv2.connectedComponentsWithStats(bin_inv, connectivity=8)[1:3]
+    _, _, stats, _ = _connected_components_stats(bin_inv)
+    # stats rows: [label][x, y, w, h, area]; row 0 is background
     hs = []
-    for s in stats:
-        x, y, w, h, area = s
+    for i in range(1, stats.shape[0]):
+        x, y, w, h, area = stats[i]
         if 5 <= h <= 200 and 5 <= w <= 200 and 20 <= area <= 2000:
             hs.append(h)
     if not hs:
@@ -99,28 +125,29 @@ def estimate_letter_height(bin_inv: np.ndarray) -> float:
 
 
 def estimate_ink_coverage(bin_inv: np.ndarray) -> float:
-    return float(bin_inv.mean())  # fraction of ink pixels
+    # fraction of ink pixels
+    return float(bin_inv.mean())
 
 
 def estimate_slant(gray: np.ndarray, bin_inv: np.ndarray) -> float:
-    # Use gradients only where ink is present
+    # Use gradients only where strong edges + ink are present, reduce ruis
     gx = cv2.Sobel(gray, cv2.CV_32F, 1, 0, ksize=3)
     gy = cv2.Sobel(gray, cv2.CV_32F, 0, 1, ksize=3)
     mag = np.hypot(gx, gy)
-    ang = np.arctan2(gy, gx)  # radians
-    mask = (mag > np.percentile(mag, 75)) & (bin_inv.astype(bool))
+    # Use a higher percentile to be stricter; avoid background texture
+    edge_thresh = np.percentile(mag, 82)
+    mask = (mag > edge_thresh) & (bin_inv.astype(bool))
     if mask.sum() < 100:
         return float('nan')
-    # Map to [-pi/2, pi/2] and compute median slant wrt vertical
-    angles = ang[mask]
-    angles = ((angles + np.pi/2 + np.pi) % np.pi) - np.pi/2
-    deg = np.degrees(np.median(angles))
+    ang = np.arctan2(gy[mask], gx[mask])  # radians
+    # Map to [-pi/2, pi/2] then measure relative to vertical
+    ang = ((ang + np.pi/2 + np.pi) % np.pi) - np.pi/2
+    deg = np.degrees(np.median(ang))
     return float(np.clip(deg, -45, 45))
 
 
 def horizontal_projection(bin_inv: np.ndarray) -> np.ndarray:
     return bin_inv.sum(axis=1)
-
 
 def vertical_projection(bin_inv: np.ndarray) -> np.ndarray:
     return bin_inv.sum(axis=0)
@@ -128,6 +155,8 @@ def vertical_projection(bin_inv: np.ndarray) -> np.ndarray:
 
 def estimate_line_spacing(bin_inv: np.ndarray) -> float:
     proj = horizontal_projection(bin_inv)
+    if proj.max() == 0:
+        return float('nan')
     thresh = np.percentile(proj, 60)
     lines = (proj > thresh).astype(np.uint8)
     gaps = []
@@ -144,14 +173,17 @@ def estimate_line_spacing(bin_inv: np.ndarray) -> float:
 
 
 def estimate_word_spacing(bin_inv: np.ndarray) -> float:
-    # Morph close to merge letters into words, then measure gaps along text rows
+    # Close horizontally to merge letters into words, then scan gaps per rij
     kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (7, 1))
     words = cv2.morphologyEx(bin_inv * 255, cv2.MORPH_CLOSE, kernel)
     proj = horizontal_projection((words // 255).astype(np.uint8))
+    if proj.max() == 0:
+        return float('nan')
     rows = np.where(proj > np.percentile(proj, 60))[0]
     if len(rows) < 3:
         return float('nan')
-    sample_rows = rows[::max(1, len(rows)//10)]
+    step = max(1, len(rows) // 10)
+    sample_rows = rows[::step]
     gaps_all = []
     for r in sample_rows:
         row = words[r, :]
@@ -173,6 +205,8 @@ def estimate_margins(bin_inv: np.ndarray) -> Tuple[float, float, float, float]:
     h, w = bin_inv.shape
     cols = vertical_projection(bin_inv)
     rows = horizontal_projection(bin_inv)
+    if cols.max() == 0 or rows.max() == 0:
+        return (float('nan'),) * 4
     try:
         left = int(np.argmax(cols > 0))
         right = int(w - np.argmax(cols[::-1] > 0) - 1)
@@ -193,7 +227,9 @@ def estimate_signature(bin_inv: np.ndarray) -> float:
     roi = bin_inv[int(0.75 * h):, :]
     if roi.size == 0:
         return 0.0
-    cnts, _ = cv2.findContours((roi * 255).astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    contours = cv2.findContours((roi * 255).astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    # OpenCV 3/4 compat
+    cnts = contours[0] if len(contours) == 2 else contours[1]
     if not cnts:
         return 0.0
     scores = []
@@ -222,7 +258,7 @@ def measure_all(gray: np.ndarray, bin_inv: np.ndarray) -> Measures:
     )
 
 # -------------------------
-# Interpretatie (rule-based)
+# Interpretation
 # -------------------------
 
 def bucketize(value: float, thresholds: List[float], labels: List[str]) -> str:
@@ -233,34 +269,36 @@ def bucketize(value: float, thresholds: List[float], labels: List[str]) -> str:
         if value <= t:
             break
         idx += 1
-    idx = min(idx, len(labels)-1)
+    idx = min(idx, len(labels) - 1)
     return labels[idx]
 
 
-def interpret(meas: Measures, dpi_guess: int = 200) -> Dict[str, str]:
+def interpret(meas: Measures, dpi_guess: int = 200) -> Dict[str, object]:
     px2mm = 25.4 / max(dpi_guess, 72)
     letter_mm = meas.letter_height_px * px2mm if not math.isnan(meas.letter_height_px) else float('nan')
     word_mm = meas.word_gap_px * px2mm if not math.isnan(meas.word_gap_px) else float('nan')
     line_mm = meas.line_gap_px * px2mm if not math.isnan(meas.line_gap_px) else float('nan')
 
-    size_cat = bucketize(letter_mm, [2.5, 4.0], ["klein", "gemiddeld", "groot"])  # x-hoogte ~2–4mm
+    size_cat = bucketize(letter_mm, [2.5, 4.0], ["klein", "gemiddeld", "groot"])
     press_cat = bucketize(meas.ink_coverage, [0.03, 0.07], ["licht", "normaal", "zwaar"])  # grove proxy
-    slant_cat = (
-        "linkshellend" if not math.isnan(meas.avg_slant_deg) and meas.avg_slant_deg < -5 else
-        "rechtshellend" if not math.isnan(meas.avg_slant_deg) and meas.avg_slant_deg > 5 else
-        "verticaal"
-    )
-    wordspace_cat = bucketize(word_mm, [3.0, 6.0], ["nauw", "gemiddeld", "ruim"])  # mm
-    linespace_cat = bucketize(line_mm, [4.0, 8.0], ["nauw", "gemiddeld", "ruim"])  # mm
+    if not math.isnan(meas.avg_slant_deg):
+        if meas.avg_slant_deg < -5:
+            slant_cat = "linkshellend"
+        elif meas.avg_slant_deg > 5:
+            slant_cat = "rechtshellend"
+        else:
+            slant_cat = "verticaal"
+    else:
+        slant_cat = "verticaal"
+
+    wordspace_cat = bucketize(word_mm, [3.0, 6.0], ["nauw", "gemiddeld", "ruim"])
+    linespace_cat = bucketize(line_mm, [4.0, 8.0], ["nauw", "gemiddeld", "ruim"])
 
     left, right, top, bottom = meas.margins_pct
     margin_left_cat = bucketize(left, [3.0, 8.0], ["smal", "gemiddeld", "breed"]) if not math.isnan(left) else "onbekend"
     margin_right_cat = bucketize(right, [3.0, 8.0], ["smal", "gemiddeld", "breed"]) if not math.isnan(right) else "onbekend"
 
-    sig_cat = (
-        "waarschijnlijk aanwezig" if meas.signature_likelihood > 0.35 else
-        "niet duidelijk"
-    )
+    sig_cat = "waarschijnlijk aanwezig" if meas.signature_likelihood > 0.35 else "niet duidelijk"
 
     meanings = {
         "lettergrootte": {
@@ -296,19 +334,19 @@ def interpret(meas: Measures, dpi_guess: int = 200) -> Dict[str, str]:
         },
     }
 
-    interp: Dict[str, str] = {
+    interp: Dict[str, object] = {
         "lettergrootte": f"{size_cat} → {meanings['lettergrootte'].get(size_cat, '')}",
         "schrijfdruk": f"{press_cat} → {meanings['schrijfdruk'].get(press_cat, '')}",
         "hellingshoek": f"{slant_cat} → {meanings['hellingshoek'].get(slant_cat, '')}",
         "woordafstand": f"{wordspace_cat} → {meanings['woordafstand'].get(wordspace_cat, '')}",
         "regelafstand": f"{linespace_cat} → {meanings['regelafstand'].get(linespace_cat, '')}",
         "marge_links": f"{margin_left_cat} → " + (
-            meanings['marges']['links_smal'] if margin_left_cat=="smal" else
-            meanings['marges']['links_breed'] if margin_left_cat=="breed" else "neutraal"
+            meanings['marges']['links_smal'] if margin_left_cat == "smal" else
+            meanings['marges']['links_breed'] if margin_left_cat == "breed" else "neutraal"
         ),
         "marge_rechts": f"{margin_right_cat} → " + (
-            meanings['marges']['rechts_smal'] if margin_right_cat=="smal" else
-            meanings['marges']['rechts_breed'] if margin_right_cat=="breed" else "neutraal"
+            meanings['marges']['rechts_smal'] if margin_right_cat == "smal" else
+            meanings['marges']['rechts_breed'] if margin_right_cat == "breed" else "neutraal"
         ),
         "handtekening": sig_cat,
         "_mm": {
@@ -320,25 +358,20 @@ def interpret(meas: Measures, dpi_guess: int = 200) -> Dict[str, str]:
     return interp
 
 
-# -------------------------
-# Profiel-generator (meerdere stijlen)
-# -------------------------
-
-def make_profile(interp: Dict[str, str], style: str = "Mystiek", length: str = "Middel") -> str:
-    size = interp["lettergrootte"].split(" → ")[0]
-    press = interp["schrijfdruk"].split(" → ")[0]
-    slant = interp["hellingshoek"].split(" → ")[0]
-    wordsp = interp["woordafstand"].split(" → ")[0]
-    linesp = interp["regelafstand"].split(" → ")[0]
-    leftm = interp["marge_links"].split(" → ")[0]
-    rightm = interp["marge_rechts"].split(" → ")[0]
+def make_profile(interp: Dict[str, object], style: str = "Mystiek", length: str = "Middel") -> str:
+    size = str(interp["lettergrootte"]).split(" → ")[0]
+    press = str(interp["schrijfdruk"]).split(" → ")[0]
+    slant = str(interp["hellingshoek"]).split(" → ")[0]
+    wordsp = str(interp["woordafstand"]).split(" → ")[0]
+    linesp = str(interp["regelafstand"]).split(" → ")[0]
+    leftm = str(interp["marge_links"]).split(" → ")[0]
+    rightm = str(interp["marge_rechts"]).split(" → ")[0]
 
     key_lines = [
         f"Letters: {size}. Druk: {press}. Slant: {slant}.",
         f"Afstand: woorden {wordsp}, regels {linesp}.",
         f"Marges: links {leftm}, rechts {rightm}.",
     ]
-
     bullet = " ".join(key_lines)
 
     base_map = {
@@ -364,15 +397,18 @@ def make_profile(interp: Dict[str, str], style: str = "Mystiek", length: str = "
 
     body_mystiek = (
         "Alsof de pen een seismograaf is van uw binnenwereld, tekent dit handschrift een stille landkaart van gewoontes en verlangens. "
-        "" + " ".join(cues) + " Samen klinkt hier iemand die ritme zoekt tussen hoofd en hart, precisie en beweging." 
+        + " ".join(cues)
+        + " Samen klinkt hier iemand die ritme zoekt tussen hoofd en hart, precisie en beweging."
     )
     body_nuchter = (
-        "Het handschrift wijst op consistente gewoontes en duidelijke voorkeuren. " + " ".join(cues) +
-        " In samenhang oogt dit als een evenwicht tussen structuur en flexibiliteit."
+        "Het handschrift wijst op consistente gewoontes en duidelijke voorkeuren. "
+        + " ".join(cues)
+        + " In samenhang oogt dit als een evenwicht tussen structuur en flexibiliteit."
     )
     body_poetisch = (
-        "De lijnen ademen; de marge laat licht vallen. " + " ".join(cues) +
-        " In dit ritme wordt een stem hoorbaar die niet schreeuwt, maar draagt."
+        "De lijnen ademen; de marge laat licht vallen. "
+        + " ".join(cues)
+        + " In dit ritme wordt een stem hoorbaar die niet schreeuwt, maar draagt."
     )
     body_coach = (
         "Sterktes die opvallen: " + ", ".join(cues[:3]) + ". "
@@ -387,32 +423,15 @@ def make_profile(interp: Dict[str, str], style: str = "Mystiek", length: str = "
     }
 
     text = style_map.get(style, body_mystiek)
-
     if length == "Kort":
         text = textwrap.shorten(text, width=350, placeholder="…")
     elif length == "Lang":
-        # voeg extra zin toe
-        text += " " + (
-            "Waar precisie en beweging elkaar kruisen, ontstaat de stijl die u onderscheidt—niet luid, wel helder."
-        )
-
+        text += " Waar precisie en beweging elkaar kruisen, ontstaat de stijl die u onderscheidt—niet luid, wel helder."
     return text
 
-
 # -------------------------
-# UI Helpers (layout/stijl)
+# UI helpers
 # -------------------------
-
-CSS = """
-<style>
-.badge {display:inline-block;padding:0.25rem 0.5rem;border-radius:999px;background:#EEF2FF;color:#1E40AF;font-size:0.85rem;margin-right:6px}
-.kpi {display:flex;gap:12px;flex-wrap:wrap;margin-bottom:0.5rem}
-.card {border:1px solid #e5e7eb;border-radius:12px;padding:16px;background:#fff}
-.small {opacity:0.75}
-.hr {height:1px;background:#e5e7eb;border:none;margin:12px 0}
-</style>
-"""
-
 
 def kpi_row(items: List[Tuple[str, str]]):
     html = ["<div class='kpi'>"]
@@ -421,9 +440,25 @@ def kpi_row(items: List[Tuple[str, str]]):
     html.append("</div>")
     st.markdown("\n".join(html), unsafe_allow_html=True)
 
+def pick_image_bytes(source: str) -> Optional[bytes]:
+    """
+    Returns bytes from chosen source:
+    - 'Upload': st.file_uploader (jpg/png)
+    - 'Camera': st.camera_input (jpg)
+    """
+    if source == "Upload":
+        file = st.file_uploader("Upload een foto/scan met handschrift (JPG/PNG)", type=["jpg", "jpeg", "png"])
+        if file:
+            return file.read()
+        return None
+    else:
+        cam = st.camera_input("Maak een foto van het handschrift (zorg voor goed licht en vlakke opname)")
+        if cam:
+            return cam.getvalue()
+        return None
 
 # -------------------------
-# Streamlit UI
+# Streamlit app
 # -------------------------
 
 def main():
@@ -435,31 +470,45 @@ def main():
 
     with st.sidebar:
         st.header("Instellingen")
+        source = st.radio("Afbeeldingsbron", ["Upload", "Camera"], index=0, help="Gebruik je telefoon voor de beste camera-ervaring.")
         resize_max = st.slider("Max breedte/hoogte (px)", 800, 2400, 1600, 100)
         dpi_guess = st.slider("DPI schatting (voor mm)", 100, 400, 200, 25)
+        st.subheader("Pre-processing")
+        denoise = st.checkbox("Ont-ruis (aanbevolen bij foto)", value=True)
+        adapt_block = st.slider("Adaptive block size", 11, 99, 35, 2)
+        adapt_C = st.slider("Adaptive C (offset)", 1, 25, 12, 1)
         st.subheader("Profiel weergave")
         style = st.selectbox("Stijl", ["Mystiek", "Nuchter analytisch", "Poëtisch", "Coaching"], index=0)
         length = st.selectbox("Lengte", ["Kort", "Middel", "Lang"], index=1)
+        debug = st.checkbox("Toon debug-tips", value=False)
 
-    file = st.file_uploader("Upload een foto/scan met handschrift (JPG/PNG)", type=["jpg", "jpeg", "png"])
-    if not file:
-        st.info("⬆️ Upload een afbeelding om te starten.")
+    img_bytes = pick_image_bytes(source)
+    if not img_bytes:
+        st.info("📷 Kies **Upload** of **Camera** en voeg een afbeelding toe om te starten.")
+        if source == "Camera":
+            st.caption("Tip: geef je browser cameratoegang. Op iOS/Safari: tandwiel → Privacy → Camera → toestaan.")
         return
 
-    img = Image.open(file).convert("RGB")
-    gray, bin_inv, vis = preprocess(img, resize_max=resize_max)
+    gray, bin_inv, vis = preprocess(
+        img_bytes,
+        resize_max=resize_max,
+        denoise=denoise,
+        adapt_block=adapt_block,
+        adapt_C=adapt_C,
+    )
 
     # Afbeeldingen
+    img_pil = Image.open(io.BytesIO(img_bytes)).convert("RGB")
     col1, col2, col3 = st.columns(3, gap="large")
     with col1:
         st.subheader("Origineel")
-        st.image(img, use_container_width=True)
+        st.image(img_pil, use_container_width=True)
     with col2:
         st.subheader("Grijs + contrast")
         st.image(gray, clamp=True, use_container_width=True)
     with col3:
         st.subheader("Binarisatie (inkt in wit)")
-        st.image((bin_inv*255).astype(np.uint8), use_container_width=True)
+        st.image((bin_inv * 255).astype(np.uint8), use_container_width=True)
 
     # Metingen & interpretatie
     meas = measure_all(gray, bin_inv)
@@ -475,18 +524,18 @@ def main():
         ("Hellingshoek", f"{meas.avg_slant_deg:+.1f}°" if not math.isnan(meas.avg_slant_deg) else "–"),
         ("Woordafstand", f"{(meas.word_gap_px*px2mm):.1f} mm" if not math.isnan(meas.word_gap_px) else "–"),
         ("Regelafstand", f"{(meas.line_gap_px*px2mm):.1f} mm" if not math.isnan(meas.line_gap_px) else "–"),
-        ("Schrijfdruk (proxy)", f"{meas.ink_coverage*100:.1f}%"),
+        ("Schrijfdruk (proxy)", f"{meas.ink_coverage*100:.2f}%"),
     ])
 
     # Chips
     chips = [
-        ("Lettergrootte", interp["lettergrootte"].split(" → ")[0]),
-        ("Druk", interp["schrijfdruk"].split(" → ")[0]),
-        ("Slant", interp["hellingshoek"].split(" → ")[0]),
-        ("Woord", interp["woordafstand"].split(" → ")[0]),
-        ("Regel", interp["regelafstand"].split(" → ")[0]),
-        ("Links", interp["marge_links"].split(" → ")[0]),
-        ("Rechts", interp["marge_rechts"].split(" → ")[0]),
+        ("Lettergrootte", str(interp["lettergrootte"]).split(" → ")[0]),
+        ("Druk", str(interp["schrijfdruk"]).split(" → ")[0]),
+        ("Slant", str(interp["hellingshoek"]).split(" → ")[0]),
+        ("Woord", str(interp["woordafstand"]).split(" → ")[0]),
+        ("Regel", str(interp["regelafstand"]).split(" → ")[0]),
+        ("Links", str(interp["marge_links"]).split(" → ")[0]),
+        ("Rechts", str(interp["marge_rechts"]).split(" → ")[0]),
     ]
     st.markdown(" ".join([f"<span class='badge'>{k}: <strong>{v}</strong></span>" for k, v in chips]), unsafe_allow_html=True)
 
@@ -505,8 +554,10 @@ def main():
         l, r, t, b = meas.margins_pct
         if not math.isnan(l):
             obs_lines.append(f"• Marges: links {l:.1f}%, rechts {r:.1f}%, boven {t:.1f}%, onder {b:.1f}%")
-        obs_lines.append(f"• Schrijfdruk (proxy inktdekking): {meas.ink_coverage*100:.1f}%")
+        obs_lines.append(f"• Schrijfdruk (proxy inktdekking): {meas.ink_coverage*100:.2f}%")
         obs_lines.append(f"• Handtekening-indicatie: {interp['handtekening']}")
+        if debug and meas.ink_coverage < 0.01:
+            st.warning("Er is zeer weinig inkt gedetecteerd. Probeer meer contrast/licht of verhoog 'Adaptive C'.")
         st.write("\n".join(obs_lines))
 
     with tabs[1]:
@@ -525,7 +576,13 @@ def main():
         profile_text = make_profile(interp, style=style, length=length)
         st.markdown(f"<div class='card'><div>{profile_text}</div></div>", unsafe_allow_html=True)
 
-        md_report = f"""# Grafologische analyse\n\n## Overzicht\n{', '.join([f"{k}: {v}" for k,v in chips])}\n\n## Objectieve observatie\n{chr(10).join(obs_lines)}\n\n## Interpretatie\n""" + "\n".join([f"- **{k}**: {v}" for k, v in inter_table.items()]) + "\n\n## Persoonlijkheidsprofiel\n" + profile_text
+        md_report = (
+            f"# Grafologische analyse\n\n"
+            f"## Overzicht\n{', '.join([f'{k}: {v}' for k, v in chips])}\n\n"
+            f"## Objectieve observatie\n{chr(10).join(obs_lines)}\n\n"
+            f"## Interpretatie\n" + "\n".join([f"- **{k}**: {v}" for k, v in inter_table.items()]) + "\n\n"
+            f"## Persoonlijkheidsprofiel\n{profile_text}\n"
+        )
         st.download_button("⬇️ Download rapport (Markdown)", data=md_report, file_name="grafologie_rapport.md")
 
     st.markdown("---")
@@ -534,7 +591,6 @@ def main():
             "Deze app gebruikt heuristieken en traditionele grafologische duidingen. "
             "Het resultaat is interpretatief en niet wetenschappelijk gevalideerd. Focus op vorm en stijl, niet op inhoud."
         )
-
 
 if __name__ == "__main__":
     main()
