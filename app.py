@@ -414,13 +414,13 @@ def main():
     col1, col2, col3 = st.columns(3, gap="large")
     with col1:
         st.subheader("Origineel")
-        st.image(img, use_column_width=True)
+        st.image(img, use_container_width=True)
     with col2:
         st.subheader("Grijs + contrast")
-        st.image(gray, clamp=True, use_column_width=True)
+        st.image(gray, clamp=True, use_container_width=True)
     with col3:
         st.subheader("Binarisatie (inkt in wit)")
-        st.image((bin_inv*255).astype(np.uint8), use_column_width=True)
+        st.image((bin_inv*255).astype(np.uint8), use_container_width=True)
 
     meas = measure_all(gray, bin_inv)
     interp = interpret(meas, dpi_guess=dpi_guess)
@@ -478,3 +478,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
